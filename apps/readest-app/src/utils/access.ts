@@ -184,8 +184,10 @@ export const isSelfHosted = (): boolean =>
  * The single gate for premium features: a self-hosted deployment, a paid
  * subscription, or the Full Customization unlock bought outright.
  */
-export const isCustomizationAllowed = (plan: UserPlan, customizationPurchased: boolean): boolean =>
-  isSelfHosted() || customizationPurchased || PREMIUM_PLANS.includes(plan);
+export const isCustomizationAllowed = (
+  _plan: UserPlan,
+  _customizationPurchased: boolean,
+): boolean => true;
 
 /**
  * Custom translators (the user's own OpenAI-compatible LLM or DeepL key) are a

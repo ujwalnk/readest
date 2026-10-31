@@ -1,0 +1,345 @@
+# Personal builds. On every push to main/master, build Readest for Linux,
+# Windows, macOS and Android and publish the installers to GitHub Releases on
+# THIS repository. The builds also update themselves from those releases.
+#
+# One-time setup (Settings -> Secrets and variables -> Actions -> Secrets):
+#   TAURI_SIGNING_PRIVATE_KEY           contents of the key made by
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD  `pnpm tauri signer generate -w personal.key`
+#   TAURI_UPDATER_PUBKEY                the matching public key it prints
+# Optional (otherwise Android is signed with a throwaway key each run):
+#   ANDROID_KEY_BASE64, ANDROID_KEY_ALIAS, ANDROID_KEY_PASSWORD
+#
+# Notes:
+#   - macOS/Windows builds are not code-signed by Apple/Microsoft (OS warnings).
+#   - Version is `<package version>-<YYYYMMDDHH>` (UTC), the same scheme as the
+#     upstream nightly builds, so pushes within the same UTC hour share a
+#     version and are not offered to each other as updates.
+name: Personal Release
+
+on:
+  push:
+    branches: [main, master]
+    paths-ignore:
+      - '**/*.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: personal-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      release_id: ${{ steps.create.outputs.release_id }}
+      tag: ${{ steps.create.outputs.tag }}
+      version: ${{ steps.create.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: create
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_UPDATER_PUBKEY: ${{ secrets.TAURI_UPDATER_PUBKEY }}
+        run: |
+          set -euo pipefail
+          for v in TAURI_SIGNING_PRIVATE_KEY TAURI_UPDATER_PUBKEY; do
+            if [ -z "${!v}" ]; then
+              echo "::error::Repository secret $v is not set (see the header of personal-release.yml)."
+              exit 1
+            fi
+          done
+          base=$(node -p "require('./apps/readest-app/package.json').version")
+          version="${base}-$(date -u +%Y%m%d%H)"
+          tag="v${version}-run${GITHUB_RUN_NUMBER}"
+          # Created as a pre-release; the final job promotes it once every
+          # platform has uploaded its files. Updaters only follow the latest
+          # non-pre-release, so a half-built release is never offered.
+          id=$(gh api "repos/${GH_REPO}/releases" \
+            -f tag_name="$tag" \
+            -f target_commitish="$GITHUB_SHA" \
+            -f name="Readest ${version}" \
+            -f body="Personal build of commit ${GITHUB_SHA}." \
+            -F prerelease=true \
+            --jq .id)
+          echo "release_id=$id" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build-desktop:
+    needs: create-release
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - os: ubuntu-22.04
+            release: linux
+            rust_target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            release: macos
+            rust_target: x86_64-apple-darwin,aarch64-apple-darwin
+            args: '--target universal-apple-darwin'
+          - os: windows-latest
+            release: windows
+            rust_target: x86_64-pc-windows-msvc
+            args: '--target x86_64-pc-windows-msvc --bundles nsis'
+    runs-on: ${{ matrix.config.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: initialize git submodules
+        run: git submodule update --init --recursive
+
+      - name: setup pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+
+      - name: setup node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v6
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: install dependencies
+        run: pnpm install --frozen-lockfile --prefer-offline
+
+      - name: copy pdfjs-dist and simplecc-dist to public directory
+        run: pnpm --filter @readest/readest-app setup-vendors
+
+      - name: install Rust stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: ${{ matrix.config.rust_target }}
+
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
+        with:
+          key: ${{ matrix.config.os }}-${{ matrix.config.release }}-cargo
+
+      # Linux ships on the CEF runtime; see apps/readest-app/scripts/tauri.mjs
+      # and the matching steps in release.yml.
+      - name: install the CEF tauri CLI from readest/tauri (linux only)
+        if: matrix.config.release == 'linux'
+        run: |
+          set -euo pipefail
+          rev=6beeb209b5514f597a26f48b7a5b9fe4c59b5f12
+          marker="$HOME/.cargo/bin/.cargo-tauri-rev"
+          if [ -x "$HOME/.cargo/bin/cargo-tauri" ] && [ "$(cat "$marker" 2>/dev/null)" = "$rev" ]; then
+            echo "cargo-tauri at $rev already installed"
+            exit 0
+          fi
+          cargo install tauri-cli --git https://github.com/readest/tauri --rev "$rev" --locked --force
+          echo "$rev" > "$marker"
+
+      - name: install dependencies (ubuntu only)
+        if: matrix.config.release == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libfontconfig-dev libgtk-3-dev libwebkit2gtk-4.1 libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1 libjavascriptcoregtk-4.1-dev gir1.2-javascriptcoregtk-4.1 gir1.2-webkit2-4.1 libappindicator3-dev librsvg2-dev patchelf xdg-utils
+
+      - name: stage CEF AppImage runtime libraries (linux only)
+        if: matrix.config.release == 'linux'
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y libnss3 libpulse0 libspeechd2 libxkbcommon-x11-0
+          nss_dir=$(dirname "$(ls /usr/lib/*-linux-gnu/nss/libsoftokn3.so)")
+          lib_dir=${nss_dir%/nss}
+          sudo cp -f --remove-destination "$nss_dir"/*.so "$lib_dir/"
+          conf=apps/readest-app/src-tauri/tauri.conf.json
+          jq --arg d "$lib_dir" '.bundle.linux.appimage.files += {
+              "/usr/lib/libspeechd.so.2": ($d + "/libspeechd.so.2"),
+              "/usr/lib/libxkbcommon-x11.so.0": ($d + "/libxkbcommon-x11.so.0")
+            }' "$conf" > "$conf.tmp" && mv "$conf.tmp" "$conf"
+
+      - name: create .env.local file for Next.js
+        shell: bash
+        run: |
+          echo "NEXT_PUBLIC_APP_PLATFORM=tauri" >> .env.local
+          cp .env.local apps/readest-app/.env.local
+
+      - name: point the app at this repository's releases
+        shell: bash
+        env:
+          REPO: ${{ github.repository }}
+          PUBKEY: ${{ secrets.TAURI_UPDATER_PUBKEY }}
+        run: node .github/scripts/personal-stamp.mjs "${{ needs.create-release.outputs.version }}"
+
+      - uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1.0.0
+        id: tauri
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_CEF_CARGO: '1'
+          STRACE_MODE: '0'
+          NODE_OPTIONS: '--max-old-space-size=8192'
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: apps/readest-app
+          tauriScript: pnpm tauri
+          releaseId: ${{ needs.create-release.outputs.release_id }}
+          args: ${{ matrix.config.args || '' }}
+
+  build-android:
+    needs: create-release
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 110
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: initialize git submodules
+        run: git submodule update --init --recursive
+
+      - name: setup pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+
+      - name: setup node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v6
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: setup Java
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: setup Android SDK
+        uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4
+        with:
+          packages: 'platform-tools'
+
+      - name: install NDK
+        run: sdkmanager "ndk;28.2.13676358"
+
+      - name: install dependencies
+        run: pnpm install --frozen-lockfile --prefer-offline
+
+      - name: copy pdfjs-dist and simplecc-dist to public directory
+        run: pnpm --filter @readest/readest-app setup-vendors
+
+      - name: install Rust stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: aarch64-linux-android
+
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
+        with:
+          key: personal-android-arm64-cargo
+
+      - name: create .env.local file for Next.js
+        run: |
+          echo "NEXT_PUBLIC_APP_PLATFORM=tauri" >> .env.local
+          cp .env.local apps/readest-app/.env.local
+
+      - name: build and upload Android apk (arm64)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/28.2.13676358
+          ANDROID_KEY_BASE64: ${{ secrets.ANDROID_KEY_BASE64 }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          REPO: ${{ github.repository }}
+          PUBKEY: ${{ secrets.TAURI_UPDATER_PUBKEY }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          TAURI_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          cd apps/readest-app/
+          rm -rf src-tauri/gen/android
+          pnpm tauri android init
+          pnpm tauri icon ../../data/icons/readest-book.png
+          git checkout .
+          # `git checkout .` above reverts tracked files, so stamp afterwards.
+          (cd ../.. && node .github/scripts/personal-stamp.mjs "${{ needs.create-release.outputs.version }}")
+
+          # Signing: your own keystore if provided, otherwise a throwaway one.
+          if [ -n "$ANDROID_KEY_BASE64" ]; then
+            alias="$ANDROID_KEY_ALIAS"
+            password="$ANDROID_KEY_PASSWORD"
+            base64 -d <<< "$ANDROID_KEY_BASE64" > "$RUNNER_TEMP/keystore.jks"
+          else
+            echo "::warning::No ANDROID_KEY_* secrets set; signing with a throwaway key (upgrades over older builds need an uninstall first)."
+            alias=personal
+            password=$(openssl rand -hex 16)
+            keytool -genkeypair -keystore "$RUNNER_TEMP/keystore.jks" -alias "$alias" \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass "$password" -keypass "$password" -dname "CN=Readest Personal Build"
+          fi
+          {
+            echo "keyAlias=$alias"
+            echo "password=$password"
+            echo "storeFile=$RUNNER_TEMP/keystore.jks"
+          } > src-tauri/gen/android/keystore.properties
+
+          version=${{ needs.create-release.outputs.version }}
+          apk=Readest_${version}_arm64.apk
+          pnpm tauri android build -t aarch64
+          cp src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk "$apk"
+
+          gh release upload "${{ needs.create-release.outputs.tag }}" "$apk" --clobber
+          # The in-app updater verifies this signature before installing.
+          pnpm tauri signer sign "$apk"
+          gh release upload "${{ needs.create-release.outputs.tag }}" "$apk.sig" --clobber
+
+  # Runs once after every build leg so the legs never race on latest.json.
+  # tauri-action writes the desktop entries; this adds Android and the
+  # changelog the updater window reads.
+  update-manifest:
+    needs: [create-release, build-desktop, build-android]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: add Android to latest.json
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          tag="${{ needs.create-release.outputs.tag }}"
+          version="${{ needs.create-release.outputs.version }}"
+          if ! gh release download "$tag" --pattern latest.json 2>/dev/null; then
+            echo "::warning::tauri-action produced no latest.json (did every desktop build fail?); starting an empty one."
+            jq -n --arg v "$version" '{version: $v, notes: "", pub_date: (now | todate), platforms: {}}' > latest.json
+          fi
+          apk="Readest_${version}_arm64.apk"
+          if gh release download "$tag" --pattern "${apk}.sig" 2>/dev/null; then
+            jq --arg url "https://github.com/${GH_REPO}/releases/download/${tag}/${apk}" \
+               --arg sig "$(cat "${apk}.sig")" \
+               '.platforms["android-arm64"] = {signature: $sig, url: $url}' latest.json > tmp.json && mv tmp.json latest.json
+          else
+            echo "::warning::Android signature not found; Android is not in latest.json."
+          fi
+          jq '{version, platforms: (.platforms | keys)}' latest.json
+          gh release upload "$tag" latest.json --clobber
+          gh release upload "$tag" apps/readest-app/release-notes.json --clobber
+
+  publish-release:
+    needs: [create-release, build-desktop, build-android, update-manifest]
+    # Promote only when every platform succeeded; otherwise it stays a
+    # pre-release so a partial build is clearly marked.
+    if: ${{ success() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release edit "${{ needs.create-release.outputs.tag }}" --prerelease=false --latest
